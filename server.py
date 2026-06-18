@@ -8,18 +8,21 @@ Para correrlo localmente (pruebas):
 En produccion (Railway) se levanta con uvicorn, ver Procfile.
 """
 import os
+from urllib.parse import urlparse
 from dotenv import load_dotenv
 
 load_dotenv()
 
 from mcp.server.fastmcp import FastMCP
 from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions, RevocationOptions
+from mcp.server.transport_security import TransportSecuritySettings
 
 import garmin_client
 import strava_client
 from auth_provider import provider as oauth_provider, login_routes
 
 SERVER_URL = os.environ["SERVER_URL"].rstrip("/")
+SERVER_HOST = urlparse(SERVER_URL).netloc  # ej: web-production-63e12.up.railway.app
 
 mcp = FastMCP(
     "garmin-strava-coach",
@@ -33,6 +36,11 @@ mcp = FastMCP(
             default_scopes=["mcp"],
         ),
         revocation_options=RevocationOptions(enabled=True),
+    ),
+    transport_security=TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=[SERVER_HOST, "localhost", "localhost:8000", "127.0.0.1:8000"],
+        allowed_origins=[SERVER_URL, "http://localhost:8000", "http://127.0.0.1:8000"],
     ),
 )
 
