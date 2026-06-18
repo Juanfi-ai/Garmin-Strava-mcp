@@ -31,7 +31,7 @@ from mcp.server.auth.provider import (
 from mcp.server.auth.provider import TokenError, AuthorizeError
 from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
 
-ACCESS_TOKEN_TTL_SECONDS = 60 * 60 * 8       # 8 horas
+ACCESS_TOKEN_TTL_SECONDS = 60 * 60 * 24 * 30     # 30 días
 REFRESH_TOKEN_TTL_SECONDS = 60 * 60 * 24 * 365  # 1 año
 AUTH_CODE_TTL_SECONDS = 60 * 5               # 5 minutos para completar el login
 
