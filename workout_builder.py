@@ -1,28 +1,22 @@
 """
 Creacion y agendado de workouts en Garmin Connect.
 
-Permite que Claude construya sesiones estructuradas (running, ciclismo,
-natacion) con pasos reales (calentamiento, intervalos, recuperacion,
-vuelta a la calma) y las agende en fechas especificas del calendario
-de Garmin. Aparecen en el reloj como workouts guiados.
-
-Zonas de FC asumidas (ajustar si el usuario tiene zonas personalizadas):
-  Z1: < 60% FCmax  — recuperacion activa
-  Z2: 60-70% FCmax — aerobico base
-  Z3: 70-80% FCmax — aerobico moderado / tempo suave
-  Z4: 80-90% FCmax — umbral / tempo duro
-  Z5: > 90% FCmax  — VO2max / intervalos
+Usa los helpers nativos de garminconnect.workout para garantizar
+el formato correcto que acepta la API de Garmin.
 """
 import datetime
+import logging
+import json
+
 from garminconnect.workout import (
     RunningWorkout,
     CyclingWorkout,
-    SwimmingWorkout,
     WorkoutSegment,
     ExecutableStep,
     RepeatGroup,
     TargetType,
     ConditionType,
+    StepType,
     create_warmup_step,
     create_interval_step,
     create_recovery_step,
@@ -31,165 +25,160 @@ from garminconnect.workout import (
 )
 from garmin_client import get_client
 
+logger = logging.getLogger(__name__)
 
-# ---------- Helpers para construir targets ----------
+# ---------- Targets con el formato correcto que acepta Garmin ----------
 
 def _hr_zone_target(zone: int) -> dict:
-    """Target de zona de FC (1-5) para un paso."""
+    """Target de zona de FC usando las claves correctas de Garmin."""
     return {
-        "targetType": {"targetTypeId": TargetType.HEART_RATE_ZONE, "targetTypeKey": "heart.rate.zone"},
-        "targetValueOne": zone,
-        "targetValueTwo": zone,
-    }
-
-
-def _pace_target(min_pace_sec_per_km: float, max_pace_sec_per_km: float) -> dict:
-    """Target de ritmo en segundos/km (velocidad en m/s internamente)."""
-    # Garmin usa velocidad en m/s para SPEED_ZONE
-    min_speed = 1000 / max_pace_sec_per_km  # ritmo mas lento = velocidad minima
-    max_speed = 1000 / min_pace_sec_per_km  # ritmo mas rapido = velocidad maxima
-    return {
-        "targetType": {"targetTypeId": TargetType.SPEED_ZONE, "targetTypeKey": "speed.zone"},
-        "targetValueOne": min_speed,
-        "targetValueTwo": max_speed,
+        "workoutTargetTypeId": TargetType.HEART_RATE_ZONE,
+        "workoutTargetTypeKey": "heart.rate.zone",
+        "displayOrder": 1,
+        "targetValueOne": float(zone),
+        "targetValueTwo": float(zone),
     }
 
 
 def _no_target() -> dict:
     return {
-        "targetType": {"targetTypeId": TargetType.NO_TARGET, "targetTypeKey": "no.target"},
+        "workoutTargetTypeId": TargetType.NO_TARGET,
+        "workoutTargetTypeKey": "no.target",
+        "displayOrder": 1,
     }
 
 
-def _time_condition(seconds: float) -> dict:
+def _distance_end_condition(meters: float) -> dict:
     return {
-        "conditionType": {"conditionTypeId": ConditionType.TIME, "conditionTypeKey": "time"},
-        "conditionValue": seconds,
+        "conditionTypeId": ConditionType.DISTANCE,
+        "conditionTypeKey": "distance",
+        "displayOrder": 2,
+        "displayable": True,
     }
 
 
-def _distance_condition(meters: float) -> dict:
-    return {
-        "conditionType": {"conditionTypeId": ConditionType.DISTANCE, "conditionTypeKey": "distance"},
-        "conditionValue": meters,
-    }
+# ---------- Constructores de steps ----------
 
-
-# ---------- Constructores de steps con target ----------
-
-def _step(step_order: int, step_type_key: str, step_type_id: int,
-          duration_seconds: float = None, distance_meters: float = None,
-          target: dict = None) -> ExecutableStep:
-    """Constructor generico de un paso de workout."""
-    end_cond = _distance_condition(distance_meters) if distance_meters else _time_condition(duration_seconds or 300)
-    step = ExecutableStep(
-        stepOrder=step_order,
-        stepType={"stepTypeId": step_type_id, "stepTypeKey": step_type_key},
-        endCondition=end_cond["conditionType"],
-        endConditionValue=distance_meters or duration_seconds or 300,
-    )
-    if target:
-        step.targetType = target["targetType"]
-        step.targetValueOne = target.get("targetValueOne")
-        step.targetValueTwo = target.get("targetValueTwo")
-    return step
-
-
-def warmup(step_order: int, duration_seconds: float, hr_zone: int = 2) -> ExecutableStep:
-    s = create_warmup_step(duration_seconds, step_order)
-    t = _hr_zone_target(hr_zone)
-    s.targetType = t["targetType"]
-    s.targetValueOne = t.get("targetValueOne")
-    s.targetValueTwo = t.get("targetValueTwo")
-    return s
-
-
-def cooldown(step_order: int, duration_seconds: float, hr_zone: int = 1) -> ExecutableStep:
-    s = create_cooldown_step(duration_seconds, step_order)
-    t = _hr_zone_target(hr_zone)
-    s.targetType = t["targetType"]
-    s.targetValueOne = t.get("targetValueOne")
-    s.targetValueTwo = t.get("targetValueTwo")
-    return s
-
-
-def interval_by_time(step_order: int, duration_seconds: float, hr_zone: int = None,
-                     pace_range: tuple = None) -> ExecutableStep:
-    """Intervalo por tiempo con zona de FC o rango de ritmo."""
-    s = create_interval_step(duration_seconds, step_order)
-    target = _hr_zone_target(hr_zone) if hr_zone else (_pace_target(*pace_range) if pace_range else _no_target())
-    s.targetType = target["targetType"]
-    s.targetValueOne = target.get("targetValueOne")
-    s.targetValueTwo = target.get("targetValueTwo")
-    return s
-
-
-def interval_by_distance(step_order: int, distance_meters: float, hr_zone: int = None,
-                          pace_range: tuple = None) -> ExecutableStep:
-    """Intervalo por distancia con zona de FC o rango de ritmo."""
-    target = _hr_zone_target(hr_zone) if hr_zone else (_pace_target(*pace_range) if pace_range else _no_target())
+def warmup_step(step_order: int, duration_seconds: float, hr_zone: int = 2) -> ExecutableStep:
     return ExecutableStep(
         stepOrder=step_order,
-        stepType={"stepTypeId": 3, "stepTypeKey": "interval"},
-        endCondition={"conditionTypeId": ConditionType.DISTANCE, "conditionTypeKey": "distance"},
-        endConditionValue=distance_meters,
-        targetType=target["targetType"],
-        targetValueOne=target.get("targetValueOne"),
-        targetValueTwo=target.get("targetValueTwo"),
+        stepType={
+            "stepTypeId": StepType.WARMUP,
+            "stepTypeKey": "warmup",
+            "displayOrder": 1,
+        },
+        endCondition={
+            "conditionTypeId": ConditionType.TIME,
+            "conditionTypeKey": "time",
+            "displayOrder": 2,
+            "displayable": True,
+        },
+        endConditionValue=float(duration_seconds),
+        targetType=_hr_zone_target(hr_zone),
     )
 
 
-def recovery_step(step_order: int, duration_seconds: float = None,
-                  distance_meters: float = None, hr_zone: int = 1) -> ExecutableStep:
-    """Paso de recuperacion entre intervalos."""
-    s = create_recovery_step(duration_seconds or 120, step_order)
-    if distance_meters:
-        s.endCondition = {"conditionTypeId": ConditionType.DISTANCE, "conditionTypeKey": "distance"}
-        s.endConditionValue = distance_meters
-    t = _hr_zone_target(hr_zone)
-    s.targetType = t["targetType"]
-    s.targetValueOne = t.get("targetValueOne")
-    s.targetValueTwo = t.get("targetValueTwo")
-    return s
-
-
-def steady_run(step_order: int, duration_seconds: float, hr_zone: int) -> ExecutableStep:
-    """Trote continuo por tiempo en una zona de FC."""
+def cooldown_step(step_order: int, duration_seconds: float, hr_zone: int = 1) -> ExecutableStep:
     return ExecutableStep(
         stepOrder=step_order,
-        stepType={"stepTypeId": 3, "stepTypeKey": "interval"},
-        endCondition={"conditionTypeId": ConditionType.TIME, "conditionTypeKey": "time"},
-        endConditionValue=duration_seconds,
-        targetType=_hr_zone_target(hr_zone)["targetType"],
-        targetValueOne=hr_zone,
-        targetValueTwo=hr_zone,
+        stepType={
+            "stepTypeId": StepType.COOLDOWN,
+            "stepTypeKey": "cooldown",
+            "displayOrder": 2,
+        },
+        endCondition={
+            "conditionTypeId": ConditionType.TIME,
+            "conditionTypeKey": "time",
+            "displayOrder": 2,
+            "displayable": True,
+        },
+        endConditionValue=float(duration_seconds),
+        targetType=_hr_zone_target(hr_zone),
+    )
+
+
+def steady_step(step_order: int, duration_seconds: float, hr_zone: int) -> ExecutableStep:
+    """Paso continuo por tiempo en una zona de FC."""
+    return ExecutableStep(
+        stepOrder=step_order,
+        stepType={
+            "stepTypeId": StepType.INTERVAL,
+            "stepTypeKey": "interval",
+            "displayOrder": 3,
+        },
+        endCondition={
+            "conditionTypeId": ConditionType.TIME,
+            "conditionTypeKey": "time",
+            "displayOrder": 2,
+            "displayable": True,
+        },
+        endConditionValue=float(duration_seconds),
+        targetType=_hr_zone_target(hr_zone),
+    )
+
+
+def interval_distance_step(step_order: int, distance_meters: float, hr_zone: int = 5) -> ExecutableStep:
+    """Intervalo por distancia en una zona de FC."""
+    return ExecutableStep(
+        stepOrder=step_order,
+        stepType={
+            "stepTypeId": StepType.INTERVAL,
+            "stepTypeKey": "interval",
+            "displayOrder": 3,
+        },
+        endCondition=_distance_end_condition(distance_meters),
+        endConditionValue=float(distance_meters),
+        targetType=_hr_zone_target(hr_zone),
+    )
+
+
+def recovery_time_step(step_order: int, duration_seconds: float) -> ExecutableStep:
+    """Recuperación por tiempo en Z1."""
+    return ExecutableStep(
+        stepOrder=step_order,
+        stepType={
+            "stepTypeId": StepType.RECOVERY,
+            "stepTypeKey": "recovery",
+            "displayOrder": 4,
+        },
+        endCondition={
+            "conditionTypeId": ConditionType.TIME,
+            "conditionTypeKey": "time",
+            "displayOrder": 2,
+            "displayable": True,
+        },
+        endConditionValue=float(duration_seconds),
+        targetType=_hr_zone_target(1),
     )
 
 
 # ---------- Plantillas de workouts ----------
 
 def build_easy_run(name: str, total_minutes: int, description: str = "") -> RunningWorkout:
-    """Rodaje suave continuo en Z2. El tipo de sesion mas comun."""
-    main_secs = (total_minutes - 20) * 60  # 10 min entrada + main + 10 min vuelta
+    """Rodaje suave continuo en Z2."""
+    warmup_secs = 600.0
+    cooldown_secs = 600.0
+    main_secs = max((total_minutes * 60) - warmup_secs - cooldown_secs, 600.0)
+
     return RunningWorkout(
         workoutName=name,
         description=description,
-        estimatedDurationInSecs=total_minutes * 60,
+        estimatedDurationInSecs=int(total_minutes * 60),
         workoutSegments=[WorkoutSegment(
             segmentOrder=1,
-            sportType={"sportTypeId": 1, "sportTypeKey": "running"},
+            sportType={"sportTypeId": 1, "sportTypeKey": "running", "displayOrder": 1},
             workoutSteps=[
-                warmup(1, 600, hr_zone=2),
-                steady_run(2, max(main_secs, 600), hr_zone=2),
-                cooldown(3, 600, hr_zone=1),
+                warmup_step(1, warmup_secs, hr_zone=2),
+                steady_step(2, main_secs, hr_zone=2),
+                cooldown_step(3, cooldown_secs, hr_zone=1),
             ]
         )]
     )
 
 
-def build_tempo_run(name: str, warmup_min: int, tempo_min: int, cooldown_min: int,
-                    description: str = "") -> RunningWorkout:
-    """Tempo continuo en Z4 (umbral). Para desarrollar ritmo de carrera."""
+def build_tempo_run(name: str, warmup_min: int, tempo_min: int,
+                    cooldown_min: int, description: str = "") -> RunningWorkout:
+    """Tempo continuo en Z4."""
     total = (warmup_min + tempo_min + cooldown_min) * 60
     return RunningWorkout(
         workoutName=name,
@@ -197,11 +186,11 @@ def build_tempo_run(name: str, warmup_min: int, tempo_min: int, cooldown_min: in
         estimatedDurationInSecs=total,
         workoutSegments=[WorkoutSegment(
             segmentOrder=1,
-            sportType={"sportTypeId": 1, "sportTypeKey": "running"},
+            sportType={"sportTypeId": 1, "sportTypeKey": "running", "displayOrder": 1},
             workoutSteps=[
-                warmup(1, warmup_min * 60, hr_zone=2),
-                steady_run(2, tempo_min * 60, hr_zone=4),
-                cooldown(3, cooldown_min * 60, hr_zone=1),
+                warmup_step(1, warmup_min * 60, hr_zone=2),
+                steady_step(2, tempo_min * 60, hr_zone=4),
+                cooldown_step(3, cooldown_min * 60, hr_zone=1),
             ]
         )]
     )
@@ -210,50 +199,54 @@ def build_tempo_run(name: str, warmup_min: int, tempo_min: int, cooldown_min: in
 def build_interval_run(name: str, warmup_min: int, interval_distance_m: int,
                        repetitions: int, recovery_seconds: int, cooldown_min: int,
                        interval_hr_zone: int = 5, description: str = "") -> RunningWorkout:
-    """Intervalos por distancia (ej: 4x1000m). Para desarrollar VO2max."""
+    """Intervalos por distancia (ej: 4x1000m)."""
     interval_steps = []
+    order = 1
     for i in range(repetitions):
-        interval_steps.append(interval_by_distance(i * 2 + 1, interval_distance_m, hr_zone=interval_hr_zone))
+        interval_steps.append(interval_distance_step(order, float(interval_distance_m), hr_zone=interval_hr_zone))
+        order += 1
         if i < repetitions - 1:
-            interval_steps.append(recovery_step(i * 2 + 2, duration_seconds=recovery_seconds))
+            interval_steps.append(recovery_time_step(order, float(recovery_seconds)))
+            order += 1
 
-    rep_group = create_repeat_group(1, interval_steps, step_order=2)
-    estimated = (warmup_min + cooldown_min) * 60 + repetitions * (interval_distance_m / 3.5 + recovery_seconds)
+    rep_group = create_repeat_group(repetitions, interval_steps, step_order=2)
+    estimated = int((warmup_min + cooldown_min) * 60 + repetitions * (interval_distance_m / 3.5 + recovery_seconds))
 
     return RunningWorkout(
         workoutName=name,
         description=description,
-        estimatedDurationInSecs=int(estimated),
+        estimatedDurationInSecs=estimated,
         workoutSegments=[WorkoutSegment(
             segmentOrder=1,
-            sportType={"sportTypeId": 1, "sportTypeKey": "running"},
+            sportType={"sportTypeId": 1, "sportTypeKey": "running", "displayOrder": 1},
             workoutSteps=[
-                warmup(1, warmup_min * 60, hr_zone=2),
+                warmup_step(1, warmup_min * 60, hr_zone=2),
                 rep_group,
-                cooldown(3, cooldown_min * 60, hr_zone=1),
+                cooldown_step(3, cooldown_min * 60, hr_zone=1),
             ]
         )]
     )
 
 
 def build_long_run(name: str, total_minutes: int, description: str = "") -> RunningWorkout:
-    """Tirada larga en Z2 con nucleo en Z3 al final para simular fatiga de carrera."""
-    warmup_secs = 600
-    z3_secs = min(total_minutes * 60 * 0.2, 1200)  # hasta 20 min en Z3 al final
-    main_secs = total_minutes * 60 - warmup_secs - z3_secs - 600
+    """Tirada larga en Z2 con bloque final en Z3."""
+    warmup_secs = 600.0
+    cooldown_secs = 600.0
+    z3_secs = float(min(total_minutes * 60 * 0.2, 1200))
+    main_secs = max((total_minutes * 60) - warmup_secs - z3_secs - cooldown_secs, 600.0)
 
     return RunningWorkout(
         workoutName=name,
         description=description,
-        estimatedDurationInSecs=total_minutes * 60,
+        estimatedDurationInSecs=int(total_minutes * 60),
         workoutSegments=[WorkoutSegment(
             segmentOrder=1,
-            sportType={"sportTypeId": 1, "sportTypeKey": "running"},
+            sportType={"sportTypeId": 1, "sportTypeKey": "running", "displayOrder": 1},
             workoutSteps=[
-                warmup(1, warmup_secs, hr_zone=2),
-                steady_run(2, max(main_secs, 600), hr_zone=2),
-                steady_run(3, int(z3_secs), hr_zone=3),
-                cooldown(4, 600, hr_zone=1),
+                warmup_step(1, warmup_secs, hr_zone=2),
+                steady_step(2, main_secs, hr_zone=2),
+                steady_step(3, z3_secs, hr_zone=3),
+                cooldown_step(4, cooldown_secs, hr_zone=1),
             ]
         )]
     )
@@ -261,51 +254,48 @@ def build_long_run(name: str, total_minutes: int, description: str = "") -> Runn
 
 def build_easy_bike(name: str, total_minutes: int, description: str = "") -> CyclingWorkout:
     """Rodaje suave de ciclismo en Z2."""
-    main_secs = (total_minutes - 20) * 60
+    warmup_secs = 600.0
+    cooldown_secs = 600.0
+    main_secs = max((total_minutes * 60) - warmup_secs - cooldown_secs, 600.0)
+
     return CyclingWorkout(
         workoutName=name,
         description=description,
-        estimatedDurationInSecs=total_minutes * 60,
+        estimatedDurationInSecs=int(total_minutes * 60),
         workoutSegments=[WorkoutSegment(
             segmentOrder=1,
-            sportType={"sportTypeId": 2, "sportTypeKey": "cycling"},
+            sportType={"sportTypeId": 2, "sportTypeKey": "cycling", "displayOrder": 1},
             workoutSteps=[
-                warmup(1, 600, hr_zone=2),
-                steady_run(2, max(main_secs, 600), hr_zone=2),
-                cooldown(3, 600, hr_zone=1),
+                warmup_step(1, warmup_secs, hr_zone=2),
+                steady_step(2, main_secs, hr_zone=2),
+                cooldown_step(3, cooldown_secs, hr_zone=1),
             ]
         )]
     )
 
 
-# ---------- Funciones de upload / schedule / consulta ----------
+# ---------- Upload / schedule / consulta ----------
 
 def upload_and_schedule_workout(workout_obj, date_str: str) -> dict:
-    """Sube un workout a Garmin Connect y lo agenda en la fecha indicada (YYYY-MM-DD).
-    Devuelve el workout_id y el scheduled_id para poder borrarlo si hace falta."""
-    import logging
-    import json
-    logger = logging.getLogger(__name__)
-
+    """Sube un workout a Garmin Connect y lo agenda en la fecha indicada."""
     client = get_client()
-
     workout_dict = workout_obj.to_dict()
     logger.info("Subiendo workout: %s", json.dumps(workout_dict, indent=2))
 
     try:
         uploaded = client.upload_workout(workout_dict)
-        logger.info("Respuesta upload: %s", json.dumps(uploaded, indent=2) if isinstance(uploaded, dict) else str(uploaded))
+        logger.info("Respuesta upload: %s", uploaded)
     except Exception as e:
         logger.error("Error en upload_workout: %s", str(e))
-        return {"error": f"Error al subir workout a Garmin: {str(e)}", "workout_dict": workout_dict}
+        return {"error": f"Error al subir workout a Garmin: {str(e)}"}
 
     workout_id = uploaded.get("workoutId") if isinstance(uploaded, dict) else None
     if not workout_id:
-        return {"error": "No se pudo obtener el workoutId tras el upload", "raw": uploaded}
+        return {"error": "No se pudo obtener el workoutId", "raw": str(uploaded)}
 
     try:
         scheduled = client.schedule_workout(workout_id, date_str)
-        logger.info("Respuesta schedule: %s", json.dumps(scheduled, indent=2) if isinstance(scheduled, dict) else str(scheduled))
+        logger.info("Respuesta schedule: %s", scheduled)
     except Exception as e:
         logger.error("Error en schedule_workout: %s", str(e))
         return {"error": f"Workout subido (id: {workout_id}) pero falló al agendarlo: {str(e)}"}
@@ -322,25 +312,18 @@ def upload_and_schedule_workout(workout_obj, date_str: str) -> dict:
 
 
 def get_scheduled_workouts_for_week(date_str: str = None) -> list:
-    """Devuelve los workouts ya agendados en Garmin para la semana de la fecha indicada
-    (o la semana actual si no se pasa fecha)."""
+    """Workouts agendados en Garmin para el mes de la fecha indicada."""
     client = get_client()
-    if date_str:
-        d = datetime.date.fromisoformat(date_str)
-    else:
-        d = datetime.date.today()
-    year = d.year
-    month = d.month
+    d = datetime.date.fromisoformat(date_str) if date_str else datetime.date.today()
     try:
-        data = client.get_scheduled_workouts(year, month)
+        data = client.get_scheduled_workouts(d.year, d.month)
         return data if isinstance(data, list) else [data]
     except Exception as e:
         return [{"error": str(e)}]
 
 
 def delete_scheduled_workout(scheduled_workout_id: str) -> dict:
-    """Borra un workout agendado del calendario de Garmin por su scheduled_id.
-    No borra el workout en sí, solo lo quita del calendario."""
+    """Borra un workout del calendario de Garmin por su scheduled_id."""
     client = get_client()
     try:
         client.unschedule_workout(scheduled_workout_id)
