@@ -186,13 +186,14 @@ def garmin_schedule_easy_run(
     name: str,
     date: str,
     total_minutes: int,
+    distance_meters: int = None,
     description: str = ""
 ) -> dict:
-    """Crea un rodaje suave (Z2) y lo agenda en el calendario de Garmin.
-    Parametros: name (nombre del workout), date (YYYY-MM-DD), total_minutes
-    (duracion total incluyendo entrada y vuelta en calor), description (opcional).
-    Ejemplo: rodaje regenerativo de 45 minutos."""
-    w = workout_builder.build_easy_run(name, total_minutes, description)
+    """Crea un rodaje suave (Z2) y lo agenda en Garmin.
+    Parametros: name, date (YYYY-MM-DD), total_minutes (duracion total),
+    distance_meters (opcional — si se pasa, el step principal usa distancia
+    en lugar de tiempo), description (opcional)."""
+    w = workout_builder.build_easy_run(name, total_minutes, distance_meters, description)
     return workout_builder.upload_and_schedule_workout(w, date)
 
 
@@ -206,9 +207,8 @@ def garmin_schedule_tempo_run(
     description: str = ""
 ) -> dict:
     """Crea un tempo run (Z4 continuo) y lo agenda en Garmin.
-    Parametros: name, date (YYYY-MM-DD), warmup_minutes, tempo_minutes
-    (parte a ritmo de umbral), cooldown_minutes, description (opcional).
-    Ejemplo: 10 min entrada + 20 min tempo + 10 min vuelta calma."""
+    Parametros: name, date (YYYY-MM-DD), warmup_minutes,
+    tempo_minutes (parte a ritmo de umbral), cooldown_minutes, description (opcional)."""
     w = workout_builder.build_tempo_run(name, warmup_minutes, tempo_minutes, cooldown_minutes, description)
     return workout_builder.upload_and_schedule_workout(w, date)
 
@@ -222,18 +222,17 @@ def garmin_schedule_interval_run(
     repetitions: int,
     recovery_seconds: int,
     cooldown_minutes: int,
-    interval_hr_zone: int = 5,
     description: str = ""
 ) -> dict:
     """Crea una sesion de intervalos por distancia y la agenda en Garmin.
-    Parametros: name, date (YYYY-MM-DD), warmup_minutes, interval_distance_meters
-    (ej: 1000 para 1km), repetitions (ej: 4), recovery_seconds (entre repeticiones),
-    cooldown_minutes, interval_hr_zone (4=umbral, 5=VO2max), description (opcional).
-    Ejemplo: 4x1000m en Z5 con 90 seg de recuperacion."""
+    Parametros: name, date (YYYY-MM-DD), warmup_minutes,
+    interval_distance_meters (ej: 1000), repetitions (ej: 4),
+    recovery_seconds (entre repeticiones), cooldown_minutes,
+    description (opcional). Sin targets de FC — solo distancias y tiempos."""
     w = workout_builder.build_interval_run(
         name, warmup_minutes, interval_distance_meters,
         repetitions, recovery_seconds, cooldown_minutes,
-        interval_hr_zone, description
+        description
     )
     return workout_builder.upload_and_schedule_workout(w, date)
 
@@ -243,12 +242,14 @@ def garmin_schedule_long_run(
     name: str,
     date: str,
     total_minutes: int,
+    distance_meters: int = None,
     description: str = ""
 ) -> dict:
     """Crea una tirada larga (Z2 con bloque final en Z3) y la agenda en Garmin.
-    Parametros: name, date (YYYY-MM-DD), total_minutes, description (opcional).
-    Ejemplo: tirada larga de 100 minutos del domingo."""
-    w = workout_builder.build_long_run(name, total_minutes, description)
+    Parametros: name, date (YYYY-MM-DD), total_minutes,
+    distance_meters (opcional — si se pasa, usa distancia en lugar de tiempo),
+    description (opcional)."""
+    w = workout_builder.build_long_run(name, total_minutes, distance_meters, description)
     return workout_builder.upload_and_schedule_workout(w, date)
 
 
@@ -260,9 +261,35 @@ def garmin_schedule_easy_bike(
     description: str = ""
 ) -> dict:
     """Crea un rodaje suave de ciclismo (Z2) y lo agenda en Garmin.
-    Para el bloque de triatlon. Parametros: name, date (YYYY-MM-DD),
-    total_minutes, description (opcional)."""
+    Parametros: name, date (YYYY-MM-DD), total_minutes, description (opcional)."""
     w = workout_builder.build_easy_bike(name, total_minutes, description)
+    return workout_builder.upload_and_schedule_workout(w, date)
+
+
+@mcp.tool()
+def garmin_schedule_swim(
+    name: str,
+    date: str,
+    pool_length_meters: int,
+    total_distance_meters: int,
+    interval_distance_meters: int = None,
+    repetitions: int = None,
+    rest_seconds: int = 20,
+    description: str = ""
+) -> dict:
+    """Crea una sesion de natacion en pileta y la agenda en Garmin.
+    Parametros: name, date (YYYY-MM-DD), pool_length_meters (25 o 50),
+    total_distance_meters (distancia total de la sesion),
+    interval_distance_meters (opcional — distancia de cada serie, ej: 100),
+    repetitions (opcional — numero de series, ej: 8),
+    rest_seconds (descanso entre series, default 20seg),
+    description (opcional, para describir la sesion).
+    Ejemplo con series: 8x100m con 20seg descanso en pileta de 25m.
+    Ejemplo continuo: 2000m sin series en pileta de 50m."""
+    w = workout_builder.build_swim(
+        name, pool_length_meters, total_distance_meters,
+        interval_distance_meters, repetitions, rest_seconds, description
+    )
     return workout_builder.upload_and_schedule_workout(w, date)
 
 
@@ -276,9 +303,8 @@ def garmin_get_scheduled_workouts(date: str = "") -> list:
 
 @mcp.tool()
 def garmin_delete_scheduled_workout(scheduled_workout_id: str) -> dict:
-    """Borra un workout del calendario de Garmin por su scheduled_id (no borra
-    el workout en si, solo lo quita del calendario). Usar para reemplazar una
-    sesion que cambio de plan."""
+    """Borra un workout del calendario de Garmin por su scheduled_id.
+    No borra el workout en si, solo lo quita del calendario."""
     return workout_builder.delete_scheduled_workout(scheduled_workout_id)
 
 
