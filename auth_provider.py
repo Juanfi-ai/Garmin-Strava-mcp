@@ -1,21 +1,21 @@
 """
-Servidor de autorizacion OAuth 2.1 minimo para nuestro MCP server.
+Servidor de autorizacion OAuth 2.1 para el MCP server.
 
-Disenado para un unico usuario (vos). En vez de conectar con un proveedor
-externo (Google, GitHub, etc), pedimos un usuario/contraseña propios
-(definidos por variables de entorno OWNER_USERNAME / OWNER_PASSWORD),
-mostramos una pantalla de login simple, y emitimos tokens propios.
+Disenado para un unico usuario (vos). Los tokens se persisten en Redis
+para sobrevivir reinicios del proceso en Railway — resuelve el problema
+de needs_reconnect despues de cada restart.
 
-Todo el estado (clientes registrados, codigos de autorizacion, tokens)
-vive en memoria. Como es un solo usuario y un solo servidor, no hace
-falta una base de datos: si el servidor reinicia, Claude.ai vuelve a
-pedir login una vez (experiencia normal de cualquier app que cierra sesion).
+Si Redis no esta disponible (desarrollo local sin REDIS_URL), cae a
+almacenamiento en memoria con un warning.
 """
 import os
 import time
 import secrets
+import json
+import logging
 from typing import Optional
 
+import redis as redis_lib
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, RedirectResponse
 from starlette.routing import Route
@@ -28,36 +28,115 @@ from mcp.server.auth.provider import (
     RefreshToken,
     construct_redirect_uri,
 )
-from mcp.server.auth.provider import TokenError, AuthorizeError
 from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
 
-ACCESS_TOKEN_TTL_SECONDS = 60 * 60 * 24 * 30     # 30 días
-REFRESH_TOKEN_TTL_SECONDS = 60 * 60 * 24 * 365  # 1 año
-AUTH_CODE_TTL_SECONDS = 60 * 5               # 5 minutos para completar el login
+logger = logging.getLogger(__name__)
 
-# Codigos de un solo uso que vinculan una sesion de login HTML con el
-# pedido de autorizacion OAuth original (para poder mostrar el form y
-# despues retomar el flujo).
+ACCESS_TOKEN_TTL_SECONDS  = 60 * 60 * 24 * 30    # 30 dias
+REFRESH_TOKEN_TTL_SECONDS = 60 * 60 * 24 * 365   # 1 año
+AUTH_CODE_TTL_SECONDS     = 60 * 5               # 5 min para completar el login
+
+# Codigos de un solo uso que vinculan la sesion de login HTML con el
+# pedido de autorizacion OAuth original. Estos si van en memoria
+# (son efimeros por diseno, duran 5 minutos maximo).
 _pending_logins: dict[str, AuthorizationParams] = {}
 _pending_clients: dict[str, OAuthClientInformationFull] = {}
 
 
-class SingleUserOAuthProvider(OAuthAuthorizationServerProvider):
-    def __init__(self):
-        self._clients: dict[str, OAuthClientInformationFull] = {}
-        self._auth_codes: dict[str, AuthorizationCode] = {}
-        self._access_tokens: dict[str, AccessToken] = {}
-        self._refresh_tokens: dict[str, RefreshToken] = {}
+# ---------- Redis ----------
 
-    # ---------- Registro de clientes (lo llama Claude.ai automaticamente) ----------
+def _get_redis() -> Optional[redis_lib.Redis]:
+    """Devuelve una conexion a Redis, o None si no hay REDIS_URL configurada."""
+    url = os.environ.get("REDIS_URL")
+    if not url:
+        logger.warning("REDIS_URL no configurada — usando almacenamiento en memoria (tokens no persisten entre reinicios)")
+        return None
+    try:
+        r = redis_lib.from_url(url, decode_responses=True)
+        r.ping()
+        return r
+    except Exception as e:
+        logger.error("No se pudo conectar a Redis: %s — usando memoria como fallback", e)
+        return None
+
+
+_redis: Optional[redis_lib.Redis] = None
+_redis_checked = False
+
+def get_redis() -> Optional[redis_lib.Redis]:
+    global _redis, _redis_checked
+    if not _redis_checked:
+        _redis = _get_redis()
+        _redis_checked = True
+        if _redis:
+            logger.info("Redis conectado — tokens persistentes activos")
+    return _redis
+
+
+# ---------- Helpers de storage (Redis o memoria) ----------
+
+# Fallback en memoria para desarrollo local
+_mem: dict = {}
+
+def _store(key: str, value: dict, ttl: int):
+    r = get_redis()
+    if r:
+        r.setex(key, ttl, json.dumps(value))
+    else:
+        _mem[key] = (time.time() + ttl, value)
+
+def _fetch(key: str) -> Optional[dict]:
+    r = get_redis()
+    if r:
+        raw = r.get(key)
+        return json.loads(raw) if raw else None
+    else:
+        entry = _mem.get(key)
+        if entry is None:
+            return None
+        expires_at, value = entry
+        if time.time() > expires_at:
+            del _mem[key]
+            return None
+        return value
+
+def _delete(key: str):
+    r = get_redis()
+    if r:
+        r.delete(key)
+    else:
+        _mem.pop(key, None)
+
+def _keys_with_prefix(prefix: str) -> list:
+    r = get_redis()
+    if r:
+        return list(r.scan_iter(f"{prefix}*"))
+    else:
+        now = time.time()
+        return [k for k, (exp, _) in list(_mem.items()) if k.startswith(prefix) and exp > now]
+
+
+# ---------- Provider OAuth ----------
+
+class SingleUserOAuthProvider(OAuthAuthorizationServerProvider):
+    """Provider OAuth 2.1 con almacenamiento persistente en Redis."""
+
+    # ---- Clientes registrados ----
 
     async def get_client(self, client_id: str) -> Optional[OAuthClientInformationFull]:
-        return self._clients.get(client_id)
+        data = _fetch(f"oauth:client:{client_id}")
+        if not data:
+            return None
+        return OAuthClientInformationFull(**data)
 
     async def register_client(self, client_info: OAuthClientInformationFull) -> None:
-        self._clients[client_info.client_id] = client_info
+        _store(
+            f"oauth:client:{client_info.client_id}",
+            client_info.model_dump(mode="json"),
+            ttl=REFRESH_TOKEN_TTL_SECONDS,
+        )
 
-    # ---------- Paso de autorizacion (pantalla de login) ----------
+    # ---- Autorizacion ----
 
     async def authorize(self, client: OAuthClientInformationFull, params: AuthorizationParams) -> str:
         login_id = secrets.token_urlsafe(24)
@@ -65,36 +144,38 @@ class SingleUserOAuthProvider(OAuthAuthorizationServerProvider):
         _pending_clients[login_id] = client
         return f"/login?login_id={login_id}"
 
+    # ---- Authorization codes ----
+
     async def load_authorization_code(
         self, client: OAuthClientInformationFull, authorization_code: str
     ) -> Optional[AuthorizationCode]:
-        code = self._auth_codes.get(authorization_code)
-        if code and code.expires_at < time.time():
-            del self._auth_codes[authorization_code]
+        data = _fetch(f"oauth:code:{authorization_code}")
+        if not data:
             return None
-        return code
+        return AuthorizationCode(**data)
 
     async def exchange_authorization_code(
         self, client: OAuthClientInformationFull, authorization_code: AuthorizationCode
     ) -> OAuthToken:
-        self._auth_codes.pop(authorization_code.code, None)
+        _delete(f"oauth:code:{authorization_code.code}")
 
-        access_token = secrets.token_urlsafe(32)
+        access_token  = secrets.token_urlsafe(32)
         refresh_token = secrets.token_urlsafe(32)
-        now = time.time()
+        now = int(time.time())
 
-        self._access_tokens[access_token] = AccessToken(
-            token=access_token,
-            client_id=client.client_id,
-            scopes=authorization_code.scopes,
-            expires_at=int(now + ACCESS_TOKEN_TTL_SECONDS),
-        )
-        self._refresh_tokens[refresh_token] = RefreshToken(
-            token=refresh_token,
-            client_id=client.client_id,
-            scopes=authorization_code.scopes,
-            expires_at=int(now + REFRESH_TOKEN_TTL_SECONDS),
-        )
+        _store(f"oauth:access:{access_token}", {
+            "token": access_token,
+            "client_id": client.client_id,
+            "scopes": authorization_code.scopes,
+            "expires_at": now + ACCESS_TOKEN_TTL_SECONDS,
+        }, ttl=ACCESS_TOKEN_TTL_SECONDS)
+
+        _store(f"oauth:refresh:{refresh_token}", {
+            "token": refresh_token,
+            "client_id": client.client_id,
+            "scopes": authorization_code.scopes,
+            "expires_at": now + REFRESH_TOKEN_TTL_SECONDS,
+        }, ttl=REFRESH_TOKEN_TTL_SECONDS)
 
         return OAuthToken(
             access_token=access_token,
@@ -104,16 +185,15 @@ class SingleUserOAuthProvider(OAuthAuthorizationServerProvider):
             scope=" ".join(authorization_code.scopes) if authorization_code.scopes else None,
         )
 
-    # ---------- Refresh tokens ----------
+    # ---- Refresh tokens ----
 
     async def load_refresh_token(
         self, client: OAuthClientInformationFull, refresh_token: str
     ) -> Optional[RefreshToken]:
-        token = self._refresh_tokens.get(refresh_token)
-        if token and token.expires_at and token.expires_at < time.time():
-            del self._refresh_tokens[refresh_token]
+        data = _fetch(f"oauth:refresh:{refresh_token}")
+        if not data:
             return None
-        return token
+        return RefreshToken(**data)
 
     async def exchange_refresh_token(
         self,
@@ -121,26 +201,26 @@ class SingleUserOAuthProvider(OAuthAuthorizationServerProvider):
         refresh_token: RefreshToken,
         scopes: list[str],
     ) -> OAuthToken:
-        # Rotamos ambos tokens (buena practica de seguridad)
-        self._refresh_tokens.pop(refresh_token.token, None)
+        _delete(f"oauth:refresh:{refresh_token.token}")
 
-        new_access = secrets.token_urlsafe(32)
+        new_access  = secrets.token_urlsafe(32)
         new_refresh = secrets.token_urlsafe(32)
-        now = time.time()
+        now = int(time.time())
         use_scopes = scopes or refresh_token.scopes
 
-        self._access_tokens[new_access] = AccessToken(
-            token=new_access,
-            client_id=client.client_id,
-            scopes=use_scopes,
-            expires_at=int(now + ACCESS_TOKEN_TTL_SECONDS),
-        )
-        self._refresh_tokens[new_refresh] = RefreshToken(
-            token=new_refresh,
-            client_id=client.client_id,
-            scopes=use_scopes,
-            expires_at=int(now + REFRESH_TOKEN_TTL_SECONDS),
-        )
+        _store(f"oauth:access:{new_access}", {
+            "token": new_access,
+            "client_id": client.client_id,
+            "scopes": use_scopes,
+            "expires_at": now + ACCESS_TOKEN_TTL_SECONDS,
+        }, ttl=ACCESS_TOKEN_TTL_SECONDS)
+
+        _store(f"oauth:refresh:{new_refresh}", {
+            "token": new_refresh,
+            "client_id": client.client_id,
+            "scopes": use_scopes,
+            "expires_at": now + REFRESH_TOKEN_TTL_SECONDS,
+        }, ttl=REFRESH_TOKEN_TTL_SECONDS)
 
         return OAuthToken(
             access_token=new_access,
@@ -150,44 +230,42 @@ class SingleUserOAuthProvider(OAuthAuthorizationServerProvider):
             scope=" ".join(use_scopes) if use_scopes else None,
         )
 
-    # ---------- Verificacion de access tokens (se llama en cada tool call) ----------
+    # ---- Verificacion de access tokens ----
 
     async def load_access_token(self, token: str) -> Optional[AccessToken]:
-        access = self._access_tokens.get(token)
-        if access and access.expires_at and access.expires_at < time.time():
-            del self._access_tokens[token]
+        data = _fetch(f"oauth:access:{token}")
+        if not data:
             return None
-        return access
+        return AccessToken(**data)
 
     async def revoke_token(self, token) -> None:
-        self._access_tokens.pop(token.token, None)
-        self._refresh_tokens.pop(token.token, None)
+        _delete(f"oauth:access:{token.token}")
+        _delete(f"oauth:refresh:{token.token}")
 
-    # ---------- Helper interno: completar el login y generar el auth code ----------
+    # ---- Helper interno: completar el login ----
 
     def complete_login(self, login_id: str) -> str:
-        """Llamado despues de validar usuario/contraseña en /login.
-        Genera el authorization_code y devuelve la redirect_uri final hacia Claude.ai."""
         params = _pending_logins.pop(login_id)
         client = _pending_clients.pop(login_id)
 
         code = secrets.token_urlsafe(32)
-        self._auth_codes[code] = AuthorizationCode(
-            code=code,
-            scopes=params.scopes or [],
-            expires_at=time.time() + AUTH_CODE_TTL_SECONDS,
-            client_id=client.client_id,
-            code_challenge=params.code_challenge,
-            redirect_uri=params.redirect_uri,
-            redirect_uri_provided_explicitly=params.redirect_uri_provided_explicitly,
-        )
+        _store(f"oauth:code:{code}", {
+            "code": code,
+            "scopes": params.scopes or [],
+            "expires_at": time.time() + AUTH_CODE_TTL_SECONDS,
+            "client_id": client.client_id,
+            "code_challenge": params.code_challenge,
+            "redirect_uri": str(params.redirect_uri),
+            "redirect_uri_provided_explicitly": params.redirect_uri_provided_explicitly,
+        }, ttl=AUTH_CODE_TTL_SECONDS)
+
         return construct_redirect_uri(str(params.redirect_uri), code=code, state=params.state)
 
 
 provider = SingleUserOAuthProvider()
 
 
-# ---------- Rutas HTTP propias: pantalla de login ----------
+# ---------- Rutas HTTP: pantalla de login ----------
 
 LOGIN_PAGE = """
 <!DOCTYPE html>
@@ -203,7 +281,7 @@ LOGIN_PAGE = """
   input {{ width:100%; padding:10px; margin-bottom:12px; border-radius:6px;
            border:1px solid #333; background:#0f1115; color:#eee; box-sizing:border-box; }}
   button {{ width:100%; padding:10px; border-radius:6px; border:none;
-            background:#ff5500; color:white; font-weight:600; cursor:pointer; }}
+            background:#1e90ff; color:white; font-weight:600; cursor:pointer; }}
   .error {{ color:#ff7070; font-size:13px; margin-bottom:12px; }}
 </style>
 </head>
@@ -225,15 +303,14 @@ async def login_get(request: Request):
     login_id = request.query_params.get("login_id", "")
     if login_id not in _pending_logins:
         return HTMLResponse("Sesion de login invalida o expirada. Volve a intentar desde Claude.", status_code=400)
-    html = LOGIN_PAGE.format(error_html="", login_id=login_id)
-    return HTMLResponse(html)
+    return HTMLResponse(LOGIN_PAGE.format(error_html="", login_id=login_id))
 
 
 async def login_post(request: Request):
     form = await request.form()
-    login_id = str(form.get("login_id", ""))
-    username = str(form.get("username", ""))
-    password = str(form.get("password", ""))
+    login_id  = str(form.get("login_id", ""))
+    username  = str(form.get("username", ""))
+    password  = str(form.get("password", ""))
 
     if login_id not in _pending_logins:
         return HTMLResponse("Sesion de login invalida o expirada. Volve a intentar desde Claude.", status_code=400)
@@ -242,17 +319,19 @@ async def login_post(request: Request):
     expected_pass = os.environ.get("OWNER_PASSWORD", "")
 
     if not secrets.compare_digest(username, expected_user) or not secrets.compare_digest(password, expected_pass):
-        html = LOGIN_PAGE.format(
-            error_html='<div class="error">Usuario o contraseña incorrectos.</div>',
-            login_id=login_id,
+        return HTMLResponse(
+            LOGIN_PAGE.format(
+                error_html='<div class="error">Usuario o contraseña incorrectos.</div>',
+                login_id=login_id,
+            ),
+            status_code=401,
         )
-        return HTMLResponse(html, status_code=401)
 
     redirect_uri = provider.complete_login(login_id)
     return RedirectResponse(redirect_uri, status_code=302)
 
 
 login_routes = [
-    Route("/login", endpoint=login_get, methods=["GET"]),
+    Route("/login", endpoint=login_get,  methods=["GET"]),
     Route("/login", endpoint=login_post, methods=["POST"]),
 ]
