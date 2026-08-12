@@ -79,30 +79,49 @@ def _cached(key: str, ttl: int, fn):
 # ---------- Funciones de datos ----------
 
 def get_sleep(days: int = 7):
-    """Datos de sueño de los ultimos N dias."""
+    """Datos de sueño de los ultimos N dias.
+    Combina get_sleep_data (fases, HRV) con get_sleep_daily (sleep score)
+    porque Garmin expone el score en un endpoint distinto.
+    """
     def fetch():
         client = get_client()
         today = datetime.date.today()
+        start = today - datetime.timedelta(days=days - 1)
+
+        # Traer sleep scores del endpoint de estadisticas diarias
+        sleep_scores_by_date = {}
+        try:
+            daily_stats = client.get_sleep_daily(_date_str(start), _date_str(today))
+            for stat in daily_stats or []:
+                cal_date = stat.get("calendarDate")
+                if cal_date:
+                    sleep_scores_by_date[cal_date] = (
+                        stat.get("sleepScore")
+                        or stat.get("overallSleepScore")
+                        or stat.get("sleepQuality")
+                    )
+        except Exception:
+            pass
+
         results = []
         for i in range(days):
             day = today - datetime.timedelta(days=i)
+            day_str = _date_str(day)
             try:
-                data = client.get_sleep_data(_date_str(day))
+                data = client.get_sleep_data(day_str)
                 if data and data.get("dailySleepDTO"):
                     dto = data["dailySleepDTO"]
-                    # Intentar distintas estructuras de sleep score segun dispositivo/firmware
+                    # Score: primero del endpoint de stats, luego intentar en get_sleep_data
                     sleep_scores = data.get("sleepScores") or {}
                     sleep_score = (
-                        sleep_scores.get("overall", {}).get("value")
+                        sleep_scores_by_date.get(day_str)
+                        or sleep_scores.get("overall", {}).get("value")
                         or sleep_scores.get("overallScore")
-                        or sleep_scores.get("totalScore")
                         or data.get("sleepScore")
-                        or data.get("overallSleepScore")
                         or dto.get("sleepScore")
-                        or dto.get("overallSleepScore")
                     )
                     results.append({
-                        "date": _date_str(day),
+                        "date": day_str,
                         "sleep_time_seconds": dto.get("sleepTimeSeconds"),
                         "deep_sleep_seconds": dto.get("deepSleepSeconds"),
                         "light_sleep_seconds": dto.get("lightSleepSeconds"),
@@ -111,9 +130,6 @@ def get_sleep(days: int = 7):
                         "sleep_score": sleep_score,
                         "avg_overnight_hrv": data.get("avgOvernightHrv"),
                         "resting_heart_rate": data.get("restingHeartRate"),
-                        # Campo de diagnostico: muestra la estructura raw de scores
-                        # para identificar donde viene el score en este dispositivo
-                        "raw_sleep_scores": sleep_scores if not sleep_score else None,
                     })
             except Exception:
                 continue
