@@ -90,6 +90,17 @@ def get_sleep(days: int = 7):
                 data = client.get_sleep_data(_date_str(day))
                 if data and data.get("dailySleepDTO"):
                     dto = data["dailySleepDTO"]
+                    # Intentar distintas estructuras de sleep score segun dispositivo/firmware
+                    sleep_scores = data.get("sleepScores") or {}
+                    sleep_score = (
+                        sleep_scores.get("overall", {}).get("value")
+                        or sleep_scores.get("overallScore")
+                        or sleep_scores.get("totalScore")
+                        or data.get("sleepScore")
+                        or data.get("overallSleepScore")
+                        or dto.get("sleepScore")
+                        or dto.get("overallSleepScore")
+                    )
                     results.append({
                         "date": _date_str(day),
                         "sleep_time_seconds": dto.get("sleepTimeSeconds"),
@@ -97,9 +108,12 @@ def get_sleep(days: int = 7):
                         "light_sleep_seconds": dto.get("lightSleepSeconds"),
                         "rem_sleep_seconds": dto.get("remSleepSeconds"),
                         "awake_seconds": dto.get("awakeSleepSeconds"),
-                        "sleep_score": (data.get("sleepScores") or {}).get("overall", {}).get("value"),
+                        "sleep_score": sleep_score,
                         "avg_overnight_hrv": data.get("avgOvernightHrv"),
                         "resting_heart_rate": data.get("restingHeartRate"),
+                        # Campo de diagnostico: muestra la estructura raw de scores
+                        # para identificar donde viene el score en este dispositivo
+                        "raw_sleep_scores": sleep_scores if not sleep_score else None,
                     })
             except Exception:
                 continue
